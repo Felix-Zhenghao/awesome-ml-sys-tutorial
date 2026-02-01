@@ -117,13 +117,13 @@ sequenceDiagram
 
     Note over SGLang: INT4 Marlin weights loaded
 
-    rect rgb(200, 230, 200)
+    rect rgb(0, 0, 0)
         Note over SGLang: Rollout Phase
         SGLang->>SGLang: Generate responses (INT4 inference)
         SGLang-->>Train: Return trajectories + logprobs
     end
 
-    rect rgb(230, 200, 200)
+    rect rgb(0, 0, 0)
         Note over Train: Training Phase
         Train->>Train: Forward with Fake INT4 Quantization
         Train->>CUDA: _FakeInt4QuantizationSTE.forward()
@@ -133,7 +133,7 @@ sequenceDiagram
         Train->>Train: Optimizer step on BF16 weights
     end
 
-    rect rgb(200, 200, 230)
+    rect rgb(0, 0, 0)
         Note over Slime: Weight Sync Phase
         Train->>Slime: Send updated BF16 weights
         Slime->>SGLang: pause_generation()
