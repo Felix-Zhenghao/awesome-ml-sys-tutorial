@@ -235,11 +235,11 @@ def update_weights(self) -> None:
 
 ### 2.1.1 Special Topic: GPTQ Format v.s Marlin Format and Their Rationale
 
-<details>
-<summary>Unfold to see what is marline format and the rationale behind marlin format</summary>
-
 > [!TIP]
 > Marlin Format: An Efficient GPU Runtime Format Enabling Fast Memory Access
+
+<details>
+<summary>Unfold to see what is marline format and the rationale behind marlin format</summary>
 
 LLM inference (especially the decode phase) is **memory-bandwidth bound** — the GPU spends most of its time waiting for weights to arrive from HBM (High Bandwidth Memory), not doing actual computation. Marlin format is designed to maximize memory access efficiency.
 
@@ -360,12 +360,11 @@ When the GPU reads from HBM, it reads in **128-byte cache lines** — this is th
 
 </details>
 
+> [!TIP]
+> GPTQ Format: Packing 8 INT4 Values into 1 INT32
 
 <details>
 <summary>Unfold to see the what is GPTQ format and the rationale behind GPTQ format</summary>
-
-> [!TIP]
-> GPTQ Format: Packing 8 INT4 Values into 1 INT32
 
 Since INT4 (4-bit) is not a native data type that CPUs/GPUs can address directly, GPTQ packs 8 consecutive INT4 values into a single INT32 (8 × 4 bits = 32 bits). This is the standard storage format for INT4 quantized weights.
 
