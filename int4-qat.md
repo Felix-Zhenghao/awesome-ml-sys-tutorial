@@ -438,28 +438,9 @@ Since INT4 (4-bit) is not a native data type that CPUs/GPUs can address directly
 
 
 
+### 2.1.2 Step 1: Pause SGLang and prepare for weight update
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-### Step 1: Pause SGLang and prepare for weight update
-
-Here, expert weights (gated_proj, up_proj and down_proj) of the rollout engine is in marlin format (we will go through this in details later and for now, you just need to know this a special bit layout format to enable efficient memory access of sglang cuda kernel). The tensor shape of marlin format is different from that of the format (GPTQ format) that is used for efficient weight quantization.
+Here, expert weights (gated_proj, up_proj and down_proj) of the rollout engine is in marlin format for efficient inference. The tensor shape of marlin format is different from the GPTQ format that slime produces.
 
 Therefore, we need to reshape the expert weight tensors on sglang so that the placeholder on sglang is of the correct shape.
 
@@ -485,8 +466,449 @@ def restore_weights_before_loading(self, layer: torch.nn.Module):
 
 </details>
 
+### 2.1.3 Step 2 and 3: Sync non-expert and expert parameters
+
+> [!TIP]
+> Expert and non-expert weights are sync'ed in different ways. Here we'll introduce why.
 
 The method separates non-expert and expert parameters because:
 - **Non-expert params**: Use Tensor Parallelism (TP) - need `all_gather` across TP group
-- **Expert params**: Use Expert Parallelism (EP) - need `all_gather` across EP group
+- **Expert params**: Use Expert Parallelism (EP) - first need `all_gather` across TP group then need `all_gather` across EP group
 
+<details>
+<summary>Unfold to see a concrete example of the difference between non-expert param sync and expert param sync</summary>
+
+#### Example Configuration
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         Example Configuration                                   │
+│                                                                                 │
+│   Model: Qwen3-MoE (or similar)                                                 │
+│   - Hidden size: 4096                                                           │
+│   - Intermediate size: 2048 (per expert)                                        │
+│   - Number of experts: 64                                                       │
+│                                                                                 │
+│   Parallelism Config (8 GPUs):                                                  │
+│   - TP (Tensor Parallel) = 2                                                    │
+│   - EP (Expert Parallel) = 4                                                    │
+│   - PP (Pipeline Parallel) = 1                                                  │
+│                                                                                 │
+│   GPU Layout:                                                                   │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │  GPU 0   │  GPU 1   │  GPU 2   │  GPU 3   │  GPU 4   │  GPU 5   │ ...   │   │
+│   │  TP=0    │  TP=1    │  TP=0    │  TP=1    │  TP=0    │  TP=1    │       │   │
+│   │  EP=0    │  EP=0    │  EP=1    │  EP=1    │  EP=2    │  EP=2    │       │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│   TP groups: {GPU0, GPU1}, {GPU2, GPU3}, {GPU4, GPU5}, {GPU6, GPU7}             │
+│   EP groups: {GPU0, GPU2, GPU4, GPU6}, {GPU1, GPU3, GPU5, GPU7}                 │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Case 1: Non-Expert Weight Sync (e.g., `attention.q_proj.weight`)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Non-Expert Sync: attention.q_proj.weight [4096, 4096]              │
+│                                                                                 │
+│   Original full weight: [4096, 4096]                                            │
+│   TP sharding: split along output dimension (dim=0)                             │
+│                                                                                 │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│   STEP 1: Each GPU holds its TP shard                                           │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│                                                                                 │
+│   GPU 0 (TP=0):  q_proj.weight [2048, 4096]  ← rows 0~2047                      │
+│   GPU 1 (TP=1):  q_proj.weight [2048, 4096]  ← rows 2048~4095                   │
+│                                                                                 │
+│   (GPU 2-7 have identical shards as GPU 0-1, duplicated across EP)              │
+│                                                                                 │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│   STEP 2: all_gather over TP group (ALL ranks receive full data)                │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│                                                                                 │
+│   all_gather({GPU0, GPU1}) →                                                    │
+│                                                                                 │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │  Both GPU 0 and GPU 1 receive:                                          │   │
+│   │  ┌────────────────────┐                                                 │   │
+│   │  │ [2048, 4096] TP=0  │  from GPU 0                                     │   │
+│   │  ├────────────────────┤                                                 │   │
+│   │  │ [2048, 4096] TP=1  │  from GPU 1                                     │   │
+│   │  └────────────────────┘                                                 │   │
+│   │  concat(dim=0) → [4096, 4096]  ✓ Full weight on BOTH GPUs               │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│   STEP 3: Only PP source rank uses the data                                     │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│                                                                                 │
+│   GPU 0 (PP source): convert_to_hf() → broadcast to SGLang  ✓ USED              │
+│   GPU 1-7: return early, discard gathered data              ✗ DISCARDED         │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Case 2: Expert Weight Sync (e.g., `experts.*.linear_fc1.weight`)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│           Expert Sync: 64 experts, each expert's linear_fc1 [4096, 4096]        │
+│                                                                                 │
+│   Total experts: 64                                                             │
+│   EP = 4 → each EP rank holds 64/4 = 16 experts                                 │
+│   TP = 2 → each expert's weight is TP-sharded across 2 GPUs                     │
+│                                                                                 │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│   INITIAL STATE: Expert distribution across GPUs                                │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│                                                                                 │
+│   ┌─────────────┬─────────────┬─────────────┬─────────────┬─────────────────┐   │
+│   │   GPU 0     │   GPU 1     │   GPU 2     │   GPU 3     │    ...          │   │
+│   │   TP=0      │   TP=1      │   TP=0      │   TP=1      │                 │   │
+│   │   EP=0      │   EP=0      │   EP=1      │   EP=1      │                 │   │
+│   ├─────────────┼─────────────┼─────────────┼─────────────┼─────────────────┤   │
+│   │ Expert 0-15 │ Expert 0-15 │ Expert 16-31│ Expert 16-31│                 │   │
+│   │ [2048,4096] │ [2048,4096] │ [2048,4096] │ [2048,4096] │                 │   │
+│   │ (TP shard)  │ (TP shard)  │ (TP shard)  │ (TP shard)  │                 │   │
+│   └─────────────┴─────────────┴─────────────┴─────────────┴─────────────────┘   │
+│                                                                                 │
+│   GPU 0 holds: experts[0:16].linear_fc1.weight[:2048, :]  (first half rows)     │
+│   GPU 1 holds: experts[0:16].linear_fc1.weight[2048:, :]  (second half rows)    │
+│   GPU 2 holds: experts[16:32].linear_fc1.weight[:2048, :] (first half rows)     │
+│   ...                                                                           │
+│                                                                                 │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│   STEP 1: all_gather over TP group (reconstruct each expert's full weight)      │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│                                                                                 │
+│   all_gather({GPU0, GPU1}) for experts 0-15:                                    │
+│                                                                                 │
+│   GPU 0 & GPU 1 both have: experts[0:16] with full [4096, 4096] each  ✓         │
+│   GPU 2 & GPU 3 both have: experts[16:32] with full [4096, 4096] each ✓         │
+│   ...                                                                           │
+│                                                                                 │
+│   But each EP group only has 16 experts, not all 64!                            │
+│                                                                                 │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│   STEP 2: all_gather over EP group (collect all experts from all EP ranks)      │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│                                                                                 │
+│   all_gather({GPU0, GPU2, GPU4, GPU6}) across EP group:                         │
+│                                                                                 │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │  After EP all_gather, ALL 4 GPUs (0,2,4,6) receive:                     │   │
+│   │                                                                         │   │
+│   │  From GPU 0 (EP=0): experts[0:16]   → 16 experts × [4096, 4096]         │   │
+│   │  From GPU 2 (EP=1): experts[16:32]  → 16 experts × [4096, 4096]         │   │
+│   │  From GPU 4 (EP=2): experts[32:48]  → 16 experts × [4096, 4096]         │   │
+│   │  From GPU 6 (EP=3): experts[48:64]  → 16 experts × [4096, 4096]         │   │
+│   │                                                                         │   │
+│   │  Total: 64 experts × [4096, 4096] on ALL GPUs in EP group               │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│   STEP 3: Only PP source rank uses the data                                     │
+│   ═══════════════════════════════════════════════════════════════════════════   │
+│                                                                                 │
+│   GPU 0 (PP source): convert_to_hf() → broadcast to SGLang  ✓ USED              │
+│   GPU 1-7: return early, discard gathered data              ✗ DISCARDED         │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Key Difference Summary
+
+| Aspect | Non-Expert | Expert (MoE) |
+|--------|-----------|--------------|
+| **Parallelism** | TP only | TP + EP |
+| **Initial state** | 1/TP of weight | 1/TP of 1/EP experts |
+| **Gather steps** | 1 (TP all_gather) | 2 (TP all_gather → EP all_gather) |
+
+</details>
+
+
+### 2.1.4 Step 4: Post-process and resume
+
+In this step, `post_process_weights()` is called with `post_process_quantization=True`, which triggers the GPTQ→Marlin format conversion.
+
+<details>
+<summary>Unfold to see a deep-dive into the GPTQ→Marlin Repack Kernel</summary>
+
+#### Overview: Three Key Insights of Marlin Format
+
+The Marlin kernel achieves fast inference by optimizing for three things:
+
+1. **Each warp thread gets weights from a single cache line** - No scattered memory accesses
+2. **INT4→FP16 unpacking with minimal instructions** - Special interleave pattern enables fast conversion
+3. **Data flows directly into Tensor Core registers without shuffle** - Weights are pre-arranged for mma.m16n8k16 instruction
+
+Let's see how the `gptq_marlin_repack_kernel` implements each of these.
+
+#### Kernel Constants and Tile Dimensions
+
+```cpp
+// From marlin.cuh
+constexpr int tile_size = 16;        // Tensor Core tile dimension (16×16)
+constexpr int tile_k_size = 16;      // Rows per tile (along K dimension)
+constexpr int tile_n_size = 64;      // Columns per tile (along N dimension)
+constexpr int repack_stages = 8;     // Pipeline stages for latency hiding
+constexpr int repack_threads = 256;  // Threads per block
+
+// INT4: 8 values per INT32
+constexpr int pack_factor = 32 / 4 = 8;
+```
+
+**Why tile_n_size = 64?**
+- A warp has 32 threads
+- Each thread handles 2 elements along N (for 2 Tensor Core fragments)
+- 4 warps × 32 threads × 2 elements = 256, but we process 16 columns per warp
+- 4 warps × 16 columns = 64 columns per tile
+
+#### Thread-to-Data Mapping: How Each Thread Knows What to Read
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                     THREAD COORDINATE CALCULATION                                │
+│                                                                                  │
+│   For 256 threads (4 warps × 32 threads):                                        │
+│                                                                                  │
+│   warp_id = threadIdx.x / 32;    // 0, 1, 2, or 3                                │
+│   th_id   = threadIdx.x % 32;    // 0~31 within each warp                        │
+│                                                                                  │
+│   Within each warp (32 threads):                                                 │
+│   tc_col = th_id / 4;            // 0~7: which of 8 column groups                │
+│   tc_row = (th_id % 4) * 2;      // 0, 2, 4, or 6: starting row                  │
+│                                                                                  │
+│   Example for warp 0:                                                            │
+│   ┌────────┬────────┬─────────┬────────────────────────────────────────────────┐ │
+│   │ th_id  │ tc_col │ tc_row  │ Handles rows (via tc_offsets)                  │ │
+│   ├────────┼────────┼─────────┼────────────────────────────────────────────────┤ │
+│   │   0    │   0    │   0     │ 0, 1, 8, 9                                     │ │
+│   │   1    │   0    │   2     │ 2, 3, 10, 11                                   │ │
+│   │   2    │   0    │   4     │ 4, 5, 12, 13                                   │ │
+│   │   3    │   0    │   6     │ 6, 7, 14, 15                                   │ │
+│   │   4    │   1    │   0     │ 0, 1, 8, 9                                     │ │
+│   │   ...  │  ...   │  ...    │ ...                                            │ │
+│   │  31    │   7    │   6     │ 6, 7, 14, 15                                   │ │
+│   └────────┴────────┴─────────┴────────────────────────────────────────────────┘ │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### The tc_offsets Pattern: Matching Tensor Core mma.m16n8k16 Layout
+
+```cpp
+constexpr int tc_offsets[4] = {0, 1, 8, 9};
+```
+
+**Why {0, 1, 8, 9}?**
+
+This pattern comes from how NVIDIA's Tensor Core `mma.m16n8k16` instruction expects its input:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              TENSOR CORE mma.m16n8k16 INPUT LAYOUT                              │
+│                                                                                  │
+│   The 16×16 K-tile is divided into two 8×16 fragments:                          │
+│                                                                                  │
+│   K-tile (16 rows × N cols):                                                     │
+│   ┌─────────────────────┐                                                        │
+│   │    Fragment 0       │  rows 0-7                                              │
+│   │  (rows 0,1,2,3,...) │                                                        │
+│   ├─────────────────────┤                                                        │
+│   │    Fragment 1       │  rows 8-15                                             │
+│   │  (rows 8,9,10,11,..)│                                                        │
+│   └─────────────────────┘                                                        │
+│                                                                                  │
+│   Each thread with tc_row=0 reads rows {0, 1, 8, 9}:                             │
+│   - From Fragment 0: rows 0, 1  (consecutive pair)                               │
+│   - From Fragment 1: rows 8, 9  (consecutive pair)                               │
+│                                                                                  │
+│   Thread mapping for 4 threads (tc_row = 0, 2, 4, 6):                            │
+│   ┌─────────────────────────────────────────────────────────┐                    │
+│   │ Thread (tc_row=0) → reads rows 0, 1, 8, 9               │                    │
+│   │ Thread (tc_row=2) → reads rows 2, 3, 10, 11             │                    │
+│   │ Thread (tc_row=4) → reads rows 4, 5, 12, 13             │                    │
+│   │ Thread (tc_row=6) → reads rows 6, 7, 14, 15             │                    │
+│   └─────────────────────────────────────────────────────────┘                    │
+│                                                                                  │
+│   All 16 rows are covered by exactly 4 threads!                                  │
+│   Each thread reads 4 values (2 from each fragment).                             │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Reading Values from Shared Memory
+
+```cpp
+// Each thread reads 8 INT4 values (4 for b1, 4 for b2)
+uint32_t vals[8];
+
+for (int i = 0; i < 4; i++) {
+    int k_idx = tc_row + tc_offsets[i];  // e.g., 0, 1, 8, 9 for tc_row=0
+
+    // Read from two column groups (b1 and b2, offset by 8)
+    uint32_t b1_val = sh_stage_int_ptr[k_idx * sh_stride + cur_n];
+    uint32_t b2_val = sh_stage_int_ptr[k_idx * sh_stride + cur_n + 8];
+
+    // Extract INT4 value using bit operations
+    vals[i]     = (b1_val >> (cur_pos * 4)) & 0xF;
+    vals[4 + i] = (b2_val >> (cur_pos * 4)) & 0xF;
+}
+```
+
+**Memory Access Pattern**:
+- `sh_stride = 64` (tile_n_size)
+- Each row of shared memory holds 64 INT4 values (16 INT32s)
+- Threads in the same warp access consecutive memory addresses → coalesced!
+
+#### pack_idx Interleave for Fast INT4→FP16 Conversion
+
+```cpp
+constexpr int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+
+uint32_t res = 0;
+for (int i = 0; i < 8; i++) {
+    res |= vals[pack_idx[i]] << (i * 4);
+}
+```
+
+**Why this specific ordering?**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              pack_idx INTERLEAVE PATTERN EXPLANATION                             │
+│                                                                                  │
+│   Input vals[8]: [v0, v1, v2, v3, v4, v5, v6, v7]                                │
+│                                                                                  │
+│   With pack_idx = {0, 2, 4, 6, 1, 3, 5, 7}:                                      │
+│                                                                                  │
+│   Output bits:                                                                   │
+│   ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐                              │
+│   │ v7  │ v5  │ v3  │ v1  │ v6  │ v4  │ v2  │ v0  │                              │
+│   │bits │bits │bits │bits │bits │bits │bits │bits │                              │
+│   │28-31│24-27│20-23│16-19│12-15│8-11 │4-7  │0-3  │                              │
+│   └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘                              │
+│                                                                                  │
+│   This groups:                                                                   │
+│   - Lower 16 bits: v0, v2, v4, v6 (even-indexed, from Fragment 0 rows 0,1)       │
+│   - Upper 16 bits: v1, v3, v5, v7 (odd-indexed, from Fragment 1 rows 8,9)        │
+│                                                                                  │
+│   ═══════════════════════════════════════════════════════════════════════════    │
+│   WHY THIS ENABLES FAST INT4→FP16 UNPACKING:                                     │
+│   ═══════════════════════════════════════════════════════════════════════════    │
+│                                                                                  │
+│   During matrix multiply, the Marlin kernel uses this sequence:                  │
+│                                                                                  │
+│   // Extract lower 4 FP16 values (from bits 0-15)                                │
+│   frag_b0 = __byte_perm(packed, 0x00000F0F, 0x5040);  // 1 instruction!          │
+│   frag_b0 = __hfma2(frag_b0, scale, zero);            // Convert to FP16         │
+│                                                                                  │
+│   // Extract upper 4 FP16 values (from bits 16-31)                               │
+│   frag_b1 = __byte_perm(packed, 0x00000F0F, 0x7060);  // 1 instruction!          │
+│   frag_b1 = __hfma2(frag_b1, scale, zero);            // Convert to FP16         │
+│                                                                                  │
+│   The interleaving allows __byte_perm to extract 4 values at once,               │
+│   rather than requiring separate shift-and-mask for each value.                  │
+│                                                                                  │
+│   Without interleaving: 8 shifts + 8 masks = 16 instructions                     │
+│   With interleaving:    2 __byte_perm = 2 instructions (8x faster!)              │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Output Memory Layout: Tile-Contiguous Storage
+
+```cpp
+constexpr int tile_size = tile_k_size * tile_n_size / pack_factor;
+//                      = 16 * 64 / 8 = 128 INT32s per tile
+
+int out_offset = (k_tile_id * n_tiles + n_tile_id) * tile_size;
+out_ptr[out_offset + th_id * 4 + warp_id] = res;
+```
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    MARLIN OUTPUT MEMORY LAYOUT                                   │
+│                                                                                  │
+│   Each 16×64 tile is stored contiguously as 128 INT32 values:                    │
+│                                                                                  │
+│   Memory: [Tile(0,0): 128 INT32][Tile(0,1): 128 INT32]...[Tile(K/16-1,N/64-1)]   │
+│                                                                                  │
+│   Within each tile (128 INT32 = 1024 INT4 = 16×64 weights):                      │
+│   ┌─────────────────────────────────────────────────────────────────────────┐    │
+│   │ Thread 0 writes: offset 0, 4, 8, 12  (one from each warp)               │    │
+│   │ Thread 1 writes: offset 1, 5, 9, 13                                     │    │
+│   │ ...                                                                     │    │
+│   │ Thread 31 writes: offset 31, 35, 39, 43                                 │    │
+│   └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                  │
+│   This layout ensures:                                                           │
+│   1. All weights for one tile are in consecutive 128-byte cache lines           │
+│   2. Weights are pre-ordered for Tensor Core fragment loading                    │
+│   3. Each warp loads its fragment from a predictable offset                      │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Pipeline Stages: Hiding Memory Latency
+
+```cpp
+constexpr int repack_stages = 8;
+
+// Start filling pipeline
+for (int pipe = 0; pipe < repack_stages - 1; pipe++) {
+    fetch_to_shared(pipe, k_tile_id, n_tile_id + pipe);
+}
+wait_for_stage();
+
+// Main loop: process one tile while fetching the next
+while (n_tile_id < n_tiles) {
+    for (int pipe = 0; pipe < repack_stages; pipe++) {
+        // Fetch next tile (async, non-blocking)
+        fetch_to_shared((pipe + 7) % 8, k_tile_id, n_tile_id + pipe + 7);
+
+        // Process current tile (compute-bound)
+        repack_tile(pipe, k_tile_id, n_tile_id + pipe);
+
+        // Wait for fetch to complete
+        wait_for_stage();
+    }
+    n_tile_id += repack_stages;
+}
+```
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    DOUBLE BUFFERING WITH 8 STAGES                                │
+│                                                                                  │
+│   Time →                                                                         │
+│   ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐                            │
+│   │ F0 │ F1 │ F2 │ F3 │ F4 │ F5 │ F6 │ P0 │ P1 │ P2 │  ...                       │
+│   └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘                            │
+│   ▲                             ▲    ▲                                           │
+│   │                             │    └─ Process tile 0                           │
+│   │                             └─ Fetch tile 6 (last of initial batch)          │
+│   └─ Start fetching tile 0                                                       │
+│                                                                                  │
+│   F = Fetch (async memory load via cp.async)                                     │
+│   P = Process (compute: extract, interleave, write)                              │
+│                                                                                  │
+│   By the time we need to process tile 0, it's already in shared memory!          │
+│   Memory latency (~300 cycles) is completely hidden by computation.              │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Summary: How the Three Insights are Implemented
+
+| Insight | Implementation |
+|---------|---------------|
+| **1. Single cache line per thread** | Tile-contiguous layout (128 bytes = 16×64 INT4 = one tile). Coalesced shared memory access via `sh_stage_int_ptr[k_idx * 64 + cur_n]` |
+| **2. Fast INT4→FP16 unpacking** | `pack_idx = {0,2,4,6,1,3,5,7}` interleaving enables `__byte_perm` to extract 4 values in 1 instruction |
+| **3. Direct Tensor Core register flow** | `tc_offsets = {0,1,8,9}` matches mma.m16n8k16 fragment layout. No shuffle needed at runtime |
+
+</details> 
