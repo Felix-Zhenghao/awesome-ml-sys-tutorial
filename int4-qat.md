@@ -1,3 +1,10 @@
+> [!TIP]
+> From zhihu (Kimi's infra engineer), to support INT4 QAT the infra team need to implement:
+> Step 1. QAT logic in the training engine.
+> Step 2. INT4 inference pipeline (out there, marlin kernel).
+> Step 3. Transfer the QAT training weights into INT4 inference weights.
+> Step 4. RL rollout (internel codebase).
+
 # 1. Megatron INT4 Fake Quantization
 
 When `OPEN_TRAINING_INT4_FAKE_QAT_FLAG` is set to "1", the entry point is the `_get_weight_tensors()` method in `TEGroupedLinear` class (in megatron/core/extensions/transformer_engine.py).
