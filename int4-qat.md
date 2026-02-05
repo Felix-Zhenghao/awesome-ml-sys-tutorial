@@ -1,9 +1,15 @@
-> [!TIP]
-> From zhihu (Kimi's infra engineer), to support INT4 QAT the infra team need to implement:
-> Step 1. QAT logic in the training engine.
-> Step 2. INT4 inference pipeline (out there, marlin kernel).
-> Step 3. Transfer the QAT training weights into INT4 inference weights.
-> Step 4. RL rollout (internel codebase).
+> [!AI-Statement]
+> 
+> The blog is written by human. Illustration are created with Claude-4.5-Opus prompted with figures drawn with hands. The model is asked to generate txt figure.
+
+# Overview
+
+Kimi-K2-Thinking is the first open source model showing that 4-bit quantization works well for post-training on very large MoE model. According to Kimi's [blog](https://moonshotai.github.io/Kimi-K2/thinking.html) and LMSys's [blog](https://lmsys.org/blog/2026-01-26-int4-qat/), INT4 QAT can match the BF16 baseline in performance and improve the RL rollout throughput significantly. The [QeRL paper](https://arxiv.org/pdf/2510.11696) also verifies this on other 4-bit dtype. For now, this is the SOTA efficient RL technique verified on very large model.
+
+In this blog, we go throught the implementation of INT4 QAT in [Slime](https://github.com/THUDM/slime) which uses [Megatron](https://github.com/NVIDIA/Megatron-LM) as the training engine and [SGLang](https://github.com/sgl-project/sglang) as the rollout engine. In this blog, we will look into the fake quantization logic in Megatron and Marlin Kernel for efficient low-bit matrix multiplication in SGLang. We will also see how Slime transfers the QAT training weights into INT4 inference weights.
+
+In one sentence, we will go through the whole pipeline and kernel-level optimization details of INT4 QAT.
+
 
 # 1. Megatron INT4 Fake Quantization
 
