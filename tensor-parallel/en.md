@@ -42,7 +42,7 @@ As we can see there are two all-reduce's on forward pass and two on backward pas
 - The input of ColWise TP is typically the same on all GPUs (result from forward all-reduce). Therefore, it separately contributes to different forward branches of different GPUs. Therefore, we need to gather and sum the gradient from all branches. This leads to an all-reduce in backward pass.
 - The input of RowWise TP is sharded column-wise. Therefore, each forward branch gets different parts of the input. So we want to merge the branches (all-reduce) in the forward pass (see figure 1), but the backward pass is much easier.
 
-According to the [ring all-reduce blog](/TechBlog/ring-all-reduce/), the communication cost of one all-reduce is approximately $2S$ per GPU where $S$ is the storage size of data to be reduced. Here we have four all-reduce's in total and all operates on a tensor of shape $[N,C]$ (typical $N = \text{bsz} \times \text{seq\_len}$ and $C$ is model dimension). So the total communication cost is $4 \times 2 \times (N \times C \times \text{byte\_per\_element})$ **per GPU per layer**. It is a balanced but expensive cost.
+According to the [ring all-reduce blog](/TechBlog/ring-all-reduce/), the communication cost of one all-reduce is approximately $2S$ per GPU where $S$ is the storage size of data to be reduced. Here we have four all-reduce's in total and all operates on a tensor of shape $[N,C]$ (typical $N = \text{bsz} \times \text{seq{\_}len}$ and $C$ is model dimension). So the total communication cost is $4 \times 2 \times (N \times C \times \text{byte{\_}per{\_}element})$ **per GPU per layer**. It is a balanced but expensive cost.
 
 ### How TP reduces memory burden on each GPU
 

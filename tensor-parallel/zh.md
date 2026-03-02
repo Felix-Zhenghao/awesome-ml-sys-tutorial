@@ -42,7 +42,7 @@ layer_tp_plan = {
 - 列切分 TP 的输入在所有 GPU 上通常是相同的（来自前向 all-reduce 的结果）。因此，它分别为不同 GPU 的不同前向分支做贡献。因此，我们需要从所有分支收集并求和梯度，这就导致了反向传播中的 all-reduce。
 - 行切分 TP 的输入是按列分片的。因此，每个前向分支获得输入的不同部分。所以我们需要在前向传播中合并分支（all-reduce）（见图 1），而反向传播则简单得多。
 
-根据 [ring all-reduce 博客](/TechBlog/ring-all-reduce/)，一次 all-reduce 的通信开销约为每个 GPU $2S$，其中 $S$ 是待归约数据的存储大小。这里我们总共有四次 all-reduce，都操作一个形状为 $[N,C]$ 的张量（通常 $N = \text{bsz} \times \text{seq\_len}$，$C$ 为模型维度）。因此，总通信开销为 $4 \times 2 \times (N \times C \times \text{byte\_per\_element})$，**每个 GPU 每层**。这是一个均衡但昂贵的开销。
+根据 [ring all-reduce 博客](/TechBlog/ring-all-reduce/)，一次 all-reduce 的通信开销约为每个 GPU $2S$，其中 $S$ 是待归约数据的存储大小。这里我们总共有四次 all-reduce，都操作一个形状为 $[N,C]$ 的张量（通常 $N = \text{bsz} \times \text{seq{\_}len}$，$C$ 为模型维度）。因此，总通信开销为 $4 \times 2 \times (N \times C \times \text{byte{\_}per{\_}element})$，**每个 GPU 每层**。这是一个均衡但昂贵的开销。
 
 ### TP 如何减少每个 GPU 的内存负担
 
